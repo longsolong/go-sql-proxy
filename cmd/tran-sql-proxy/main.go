@@ -7,20 +7,18 @@ import (
 	"io"
 	"net"
 	"time"
+	"strings"
 
 	"github.com/siddontang/go-mysql/client"
 	"github.com/siddontang/go-mysql/packet"
 	"github.com/siddontang/go-mysql/server"
+	"github.com/siddontang/go-mysql/mysql"
 	"github.com/sirupsen/logrus"
 )
 
 var (
-	listenUseDomainSocket  = flag.Bool("listen-use-domain-socket", false, "listen on a domain socket instead of a TCP port")
 	listen                 = flag.String("listen", ":5123", "listening addr")
-	listenDomainSocket     = flag.String("listen-domain-socket", "/tmp/invalid.sock", "listening domain sock")
-	backendUseDomainSocket = flag.Bool("backend-use-domain-socket", false, "backend use a domain socket instead of a TCP port")
 	backend                = flag.String("backend", "localhost:3306", "backend addr")
-	backendDomainSocket    = flag.String("backend-domain-socket", "/tmp/mysql.sock", "backend domain sock")
 	backendUsername        = flag.String("backend-username", "root", "backend username")
 	backendPassword        = flag.String("backend-password", "", "backend password")
 	backendDbName          = flag.String("backend-dbname", "test", "backend dbname")
@@ -81,7 +79,7 @@ func (p *Proxy) Start() error {
 	p.donec = make(chan struct{})
 	errc := make(chan error, 1)
 	var err error
-	p.l, err = net.Listen("tcp", *listen)
+	p.l, err = net.Listen(getNetProto(*listen), *listen)
 	if err != nil {
 		p.Close()
 		return fmt.Errorf("create listener: %s", err)
@@ -89,6 +87,14 @@ func (p *Proxy) Start() error {
 	go p.serveListener(errc, p.l)
 	go p.awaitFirstError(errc)
 	return nil
+}
+
+func getNetProto(addr string) string {
+	proto := "tcp"
+	if strings.Contains(addr, "/") {
+		proto = "unix"
+	}
+	return proto
 }
 
 func (p *Proxy) awaitFirstError(errc <-chan error) {
@@ -132,6 +138,13 @@ type DialProxy struct {
 	DialTimeout time.Duration
 }
 
+func (dp *DialProxy) dialTimeout() time.Duration {
+	if dp.DialTimeout > 0 {
+		return dp.DialTimeout
+	}
+	return 10 * time.Second
+}
+
 // UnderlyingConn returns c.Conn if c of type *Conn,
 // otherwise it returns c.
 func UnderlyingConn(c net.Conn) net.Conn {
@@ -149,7 +162,11 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 		logrus.Printf("for incoming conn %v, error handshake: %v", src.RemoteAddr().String(), err)
 		return
 	}
-	defer serverConn.Close()
+	defer func() {
+		if !serverConn.Closed() {
+			serverConn.Close()
+		}
+	}()
 
 	clientConn, err := client.Connect(dp.Addr, dp.Username, dp.Password, dp.DbName)
 	if err != nil {
@@ -158,11 +175,18 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 	}
 	defer clientConn.Close()
 
-	logrus.Printf("%q <> %q: dialing success", src.RemoteAddr().String(), dp.Addr)
+	logrus.Printf("%q <> %q: proxy dialing success", src.RemoteAddr().String(), dp.Addr)
 	errc := make(chan error, 1)
 	go proxyCopy(errc, serverConn.Conn, clientConn.Conn)
-	go proxyCopy(errc, clientConn.Conn, serverConn.Conn)
-	<-errc
+	go func() {
+		serverConn.Conn.Reader = io.TeeReader(serverConn.Conn.Reader, clientConn.Conn)
+		for !serverConn.Closed() {
+			HandleCommand(errc, serverConn)
+		}
+	}()
+
+	err = <-errc
+	logrus.Printf("%q <> %q: proxy exit err: %v", src.RemoteAddr().String(), dp.Addr, err)
 }
 
 // proxyCopy is the function that copies bytes around.
@@ -178,9 +202,46 @@ func proxyCopy(errc chan<- error, dst, src net.Conn) {
 	errc <- err
 }
 
-func (dp *DialProxy) dialTimeout() time.Duration {
-	if dp.DialTimeout > 0 {
-		return dp.DialTimeout
+func HandleCommand(errc chan<- error, serverConn *server.Conn) {
+	data, err := serverConn.ReadPacket()
+	if err != nil {
+		errc <- err
+		return
 	}
-	return 10 * time.Second
+	go dispatch(serverConn, data)
+
+	if serverConn.Conn != nil {
+		serverConn.ResetSequence()
+	}
+}
+
+func dispatch(c *server.Conn, data []byte) {
+	cmd := data[0]
+	data = data[1:]
+
+	switch cmd {
+	case mysql.COM_QUIT:
+		c.Close()
+		logrus.Printf("%q COM_QUIT %s", c.RemoteAddr().String(), data)
+	case mysql.COM_QUERY:
+		logrus.Printf("%q COM_QUERY %s", c.RemoteAddr().String(), data)
+	case mysql.COM_PING:
+		logrus.Printf("%q COM_PING", c.RemoteAddr().String())
+	case mysql.COM_INIT_DB:
+		logrus.Printf("%q COM_INIT_DB %s", c.RemoteAddr().String(), data)
+	case mysql.COM_FIELD_LIST:
+		logrus.Printf("%q COM_FIELD_LIST", c.RemoteAddr().String())
+	case mysql.COM_STMT_PREPARE:
+		logrus.Printf("%q COM_STMT_PREPARE %s", c.RemoteAddr().String(), data)
+	case mysql.COM_STMT_EXECUTE:
+		logrus.Printf("%q COM_STMT_EXECUTE %s", c.RemoteAddr().String(), data)
+	case mysql.COM_STMT_CLOSE:
+		logrus.Printf("%q COM_STMT_CLOSE", c.RemoteAddr().String())
+	case mysql.COM_STMT_SEND_LONG_DATA:
+		logrus.Printf("%q COM_STMT_SEND_LONG_DATA %s", c.RemoteAddr().String(), data)
+	case mysql.COM_STMT_RESET:
+		logrus.Printf("%q COM_STMT_RESET %s", c.RemoteAddr().String(), data)
+	default:
+		logrus.Printf("%q CMD_OTHER %s", c.RemoteAddr().String(), data)
+	}
 }

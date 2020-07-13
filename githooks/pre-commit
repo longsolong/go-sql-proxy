@@ -1,0 +1,32 @@
+#!/bin/sh
+
+STAGED_GO_FILES=$(git diff --cached --name-only | grep ".go$")
+PKG_LIST=$(go list ./... | grep -v /vendor/)
+
+if [[ "$STAGED_GO_FILES" = "" ]]; then
+  exit 0
+fi
+
+PASS=true
+
+for FILE in $PKG_LIST
+do
+  goimports -w $FILE
+
+  golint "-set_exit_status" $FILE
+  if [[ $? == 1 ]]; then
+    PASS=false
+  fi
+done
+
+go vet $(go list ./... | grep -v /vendor/)
+if [[ $? != 0 ]]; then
+  PASS=false
+fi
+
+if ! $PASS; then
+  printf "COMMIT FAILED\n"
+  exit 1
+fi
+
+exit 0
